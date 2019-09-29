@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -21,8 +20,7 @@ import (
 
 func check(err error) {
 	if err != nil {
-		fmt.Println(err)
-		runtime.Goexit()
+		log.Fatal(err)
 	}
 }
 
@@ -34,8 +32,7 @@ func recvFromClient(fd int) []byte {
 		n, _, err := unix.Recvfrom(fd, tmpBuf, 0)
 		check(errors.Wrapf(err, "while reading into buf from socket"))
 		buf = append(buf, tmpBuf[:n]...)
-		// We only get < maxSize bytes when it is the last chunk of the message. I would have expected to
-		// get 0 here but that doesn't seem to happen.
+		// We only get < maxSize bytes when it is the last chunk of the message.
 		if n < maxSize {
 			break
 		}
@@ -49,7 +46,17 @@ func closeFd(fd int) {
 		log.Printf("error while trying to close socket: [%v], %+v", fd, err)
 		return
 	}
-	fmt.Println("file descriptor closed")
+}
+
+func parseHostPort(proxy string) (ip [4]byte, port int) {
+	host, pport, err := net.SplitHostPort(proxy)
+	check(errors.Wrapf(err, "while splitting proxy address"))
+	iport, err := strconv.Atoi(pport)
+	check(errors.Wrapf(err, "while converting port to an integer"))
+	proxyIp := net.ParseIP(host)
+
+	copy(ip[:], proxyIp)
+	return ip, iport
 }
 
 func main() {
@@ -63,7 +70,7 @@ func main() {
 
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
-	// Create a socket and connect to proxy server on it.
+	// Create a socket which we use to connect to proxy server.
 	proxyFd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM, 0)
 	check(errors.Wrapf(err, "while creating socket to proxy server."))
 
@@ -71,24 +78,20 @@ func main() {
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-c
+		// Catch Interrupt and close file descriptor for proxy.
 		closeFd(proxyFd)
 		os.Exit(1)
 	}()
 
-	host, pport, err := net.SplitHostPort(*proxy)
-	check(errors.Wrapf(err, "while splitting proxy address"))
-	iport, err := strconv.Atoi(pport)
-	check(errors.Wrapf(err, "while converting port to an integer"))
-	ip := net.ParseIP(host)
-
-	var proxyIp [4]byte
-	copy(proxyIp[:], ip)
+	proxyIp, proxyPort := parseHostPort(*proxy)
 	proxySocketAddr := &unix.SockaddrInet4{
-		Port: iport,
+		Port: proxyPort,
 		Addr: proxyIp,
 	}
 	err = unix.Connect(proxyFd, proxySocketAddr)
 	check(errors.Wrapf(err, "while binding socket"))
+
+	cache := make(map[string][]byte)
 
 	// Create a socket to bind to a port locally. Also start listening on it for connections from
 	// clients.
@@ -101,22 +104,21 @@ func main() {
 		Addr: [4]byte{127, 0, 0, 1},
 	})
 	check(errors.Wrapf(err, "while binding socket"))
-
-	cache := make(map[string][]byte)
+	fmt.Printf("Created socket and bound to port: %v\n", *port)
 
 	err = unix.Listen(fd, 1)
 	check(errors.Wrapf(err, "while listening on socket"))
 
 	for {
 		// Start accepting socket connections from clients.
-		clientSocketFd, clientSocketAddr, err := unix.Accept(fd)
+		clientSocketFd, _, err := unix.Accept(fd)
 		check(errors.Wrapf(err, "while accepting connections on socket"))
-		fmt.Printf("conn addr=%v fd=%d\n", clientSocketAddr.(*unix.SockaddrInet4).Addr, clientSocketFd)
 
 		for {
 			buf := recvFromClient(clientSocketFd)
-			fmt.Println("from client bytes: ", string(buf), "n: ", len(buf))
 			if len(buf) == 0 {
+				// Zero bytes means the client closed the connection. Lets close the socket and
+				// break from this loop so that we cna accept connection from other clients.
 				closeFd(clientSocketFd)
 				break
 			}
@@ -134,12 +136,10 @@ func main() {
 				}
 			}
 
-			n, err := unix.Write(proxyFd, buf)
+			_, err = unix.Write(proxyFd, buf)
 			check(errors.Wrapf(err, "while sending message on socket to proxy server"))
-			fmt.Println("bytes written to proxy: ", n)
 
 			buf = recvFromClient(proxyFd)
-			fmt.Println("from proxy: ", string(buf))
 
 			_, err = unix.Write(clientSocketFd, buf)
 			check(errors.Wrapf(err, "while sending message on socket to client"))
